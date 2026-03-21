@@ -71,6 +71,14 @@ async def solve(request: Request):
         return {"status": "completed"}
 
 
+@app.get("/solve")
+async def solve_get():
+    return {"status": "ok", "message": "Tripletex AI Agent ready. POST to /solve with task data."}
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Tripletex AI Accounting Agent"}
