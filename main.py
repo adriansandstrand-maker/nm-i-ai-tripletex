@@ -11,7 +11,10 @@ except ImportError:
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-from agent import solve_task
+# Lazy import to avoid cold start issues
+def _get_solve_task():
+    from agent import solve_task
+    return solve_task
 
 load_dotenv()
 
@@ -56,6 +59,7 @@ async def solve(request: Request):
     try:
         attachments = body.attachments
 
+        solve_task = _get_solve_task()
         result = await solve_task(
             prompt=body.prompt,
             language=body.language,
