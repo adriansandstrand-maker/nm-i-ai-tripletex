@@ -1,410 +1,307 @@
-"""LLM-powered agent that parses prompts and executes Tripletex API calls."""
+"""Tripletex AI Agent V4 — Agentic loop with tool use."""
 
 import json
 import logging
 import base64
+import datetime
 import traceback
 
 import anthropic
-
-from tripletex_client import TripletexClient
+import httpx
 
 logger = logging.getLogger("agent")
 
-SYSTEM_PROMPT = """\
-You are a Tripletex accounting API automation agent. You receive a task prompt \
-(possibly in Norwegian Bokmål, Nynorsk, English, Spanish, Portuguese, German, or French) \
-and must determine the exact Tripletex API calls needed to complete the task.
+TODAY = datetime.date.today().isoformat()
 
-## Tripletex API Reference
+SYSTEM_PROMPT = f"""\
+You are a Tripletex accounting API agent. Today is {TODAY}.
+You have access to a tool `tripletex_api` to call the Tripletex REST API.
+Plan your approach, then make API calls one at a time.
 
-Base patterns:
-- List: GET /v2/{resource}?fields=*&from=0&count=100
-- Create: POST /v2/{resource} with JSON body
-- Update: PUT /v2/{resource}/{id} with full JSON body
-- Delete: DELETE /v2/{resource}/{id}
-- Auth is handled for you — just specify path, method, and body.
+## RULES
+1. Parse the ENTIRE task prompt first. Extract ALL values (names, emails, amounts, dates, org numbers).
+2. Search before creating — the sandbox may have pre-loaded data.
+3. Minimize write calls (POST/PUT/DELETE). GET calls are free.
+4. Dates: YYYY-MM-DD format. Use {TODAY} if not specified.
+5. Return final message "DONE" when complete.
 
-Key endpoints:
-- /v2/employee — firstName, lastName, email, dateOfBirth (YYYY-MM-DD), etc.
-- /v2/customer — name, email, phoneNumber, postalAddress, etc.
-- /v2/product — name, number, priceExcludingVat, priceIncludingVat, vatType (id ref), etc.
-- /v2/order — customer (id ref), deliveryDate, orderDate, orderLines, etc.
-- /v2/order/orderline — order (id ref), product (id ref), count, unitPriceExcludingVat, etc.
-- /v2/invoice — create from order: POST /v2/invoice with invoiceDate, order (id ref)
-- /v2/invoice/{id}/:payment — paymentDate, paymentType (id ref), amount, amountCurrency
-- /v2/invoice/{id}/:createCreditNote — create credit note for invoice
-- /v2/project — name, number, projectManager (employee id ref), customer (id ref), etc.
-- /v2/department — name, departmentNumber
-- /v2/travelExpense — employee (id ref), project (id ref), etc.
-- /v2/ledger/voucher — for corrections
-- /v2/contact — for contact persons on customers
-- /v2/ledger/account — chart of accounts
-- /v2/currency — currencies
-- /v2/ledger/vatType — VAT types
+## API REFERENCE (EXACT field names from Swagger)
 
-ID references use format: {"id": 123}
+Response format:
+- Single entity: {{"value": {{"id": 123, ...}}}}
+- List: {{"fullResultSize": N, "values": [...]}}
 
-## Address format for customers/employees:
-postalAddress: {"addressLine1": "...", "postalCode": "...", "city": "..."}
+### POST /v2/employee — Required: firstName, lastName. Optional: email, dateOfBirth, phoneNumberMobile
 
-## Important rules:
-1. Parse the prompt completely BEFORE outputting any API calls.
-2. Extract ALL required fields from the prompt — names, emails, amounts, dates, etc.
-3. For multi-step tasks (e.g., create invoice), output steps in dependency order.
-4. Use GET calls to discover existing resources when needed (e.g., find vatType IDs).
-5. Minimize write calls — combine where possible.
-6. Use response IDs from earlier steps in later steps (referenced as $step_N_id).
-7. For dates, use YYYY-MM-DD format.
-8. Norwegian characters (æ, ø, å) are fine — use them as-is.
-9. When looking up VAT types, GET /v2/ledger/vatType?fields=id,name,number,percentage
+### POST /v2/customer — Required: name. Optional: email, phoneNumber, organizationNumber, isCustomer (true)
 
-## Creating an invoice workflow:
-1. Create customer (if not existing): POST /v2/customer
-2. Create product (if not existing): POST /v2/product
-3. Create order: POST /v2/order with customer ref, deliveryDate, orderDate
-4. Add order lines: POST /v2/order/orderline with order ref, product ref, count, unitPriceExcludingVat
-5. Create invoice from order: POST /v2/invoice with invoiceDate, order ref
-   OR: POST /v2/order/{id}/:invoice with invoiceDate
+### POST /v2/supplier — Required: name. Optional: email, organizationNumber, isSupplier (true)
 
-## Output format:
-Return a JSON array of steps. Each step has:
-- "method": "GET" | "POST" | "PUT" | "DELETE"
-- "path": the API path (e.g., "/v2/employee")
-- "params": query params for GET (optional)
-- "body": JSON body for POST/PUT (optional)
-- "description": brief description of what this step does
-- "save_as": variable name to save the response ID as (optional, e.g., "customer_id")
-- "save_field": dot-path to extract from response (default: "value.id")
-- "depends_on": list of save_as names this step needs (optional)
+### POST /v2/product — Required: name
+PRICE FIELDS (exact names — NOT priceExcludingVat):
+- priceExcludingVatCurrency (selling price ex VAT)
+- priceIncludingVatCurrency (selling price incl VAT)
+- costExcludingVatCurrency (purchase cost ex VAT)
+Optional: number (string!), vatType ({{"id": N}})
 
-For steps that depend on earlier steps, use {{variable_name}} in path or body values.
+### POST /v2/order — Required: customer ({{"id": N}}), deliveryDate, orderDate
 
-Example: create employee
-```json
-[
-  {
-    "method": "POST",
-    "path": "/v2/employee",
-    "body": {"firstName": "Ola", "lastName": "Nordmann", "email": "ola@example.com"},
-    "description": "Create employee Ola Nordmann",
-    "save_as": "employee_id"
-  }
-]
-```
+### POST /v2/order/orderline — Required: order ({{"id": N}}), product ({{"id": N}}), count
+Optional: unitPriceExcludingVatCurrency (overrides product price)
 
-Example: create invoice for new customer
-```json
-[
-  {
-    "method": "GET",
-    "path": "/v2/ledger/vatType",
-    "params": {"fields": "id,name,number,percentage", "count": 100},
-    "description": "Get VAT types to find correct ID",
-    "save_as": "vat_types",
-    "save_field": "values"
-  },
-  {
-    "method": "POST",
-    "path": "/v2/customer",
-    "body": {"name": "Acme AS", "email": "acme@example.com"},
-    "description": "Create customer",
-    "save_as": "customer_id"
-  },
-  {
-    "method": "POST",
-    "path": "/v2/product",
-    "body": {"name": "Consulting", "priceExcludingVat": 1000, "vatType": {"id": "{{vat_type_25}}"}},
-    "description": "Create product",
-    "save_as": "product_id"
-  },
-  {
-    "method": "POST",
-    "path": "/v2/order",
-    "body": {"customer": {"id": "{{customer_id}}"}, "deliveryDate": "2024-01-15", "orderDate": "2024-01-15"},
-    "description": "Create order",
-    "save_as": "order_id"
-  },
-  {
-    "method": "POST",
-    "path": "/v2/order/orderline",
-    "body": {"order": {"id": "{{order_id}}"}, "product": {"id": "{{product_id}}"}, "count": 1},
-    "description": "Add order line"
-  },
-  {
-    "method": "POST",
-    "path": "/v2/order/{{order_id}}/:invoice",
-    "body": {"invoiceDate": "2024-01-15"},
-    "description": "Create invoice from order",
-    "save_as": "invoice_id"
-  }
-]
-```
+### PUT /v2/order/ORDER_ID/:invoice — Creates invoice from order
+⚠️ ALL PARAMETERS ARE QUERY PARAMS, NOT BODY:
+  params: {{"invoiceDate": "{TODAY}"}}
+  body: {{}} (empty or omit)
+  Returns the created invoice with id.
 
-RESPOND WITH ONLY THE JSON ARRAY. No markdown, no explanation — just valid JSON.
+### POST /v2/invoice — Direct creation (body): invoiceDate, invoiceDueDate, orders ([{{"id": N}}])
+
+### PUT /v2/invoice/INVOICE_ID/:payment — Register payment on invoice  
+⚠️ ALL PARAMETERS ARE QUERY PARAMS, NOT BODY:
+  params: {{"paymentDate": "{TODAY}", "paymentTypeId": 1, "paidAmount": 10000}}
+  body: {{}} (empty or omit)
+
+### PUT /v2/invoice/INVOICE_ID/:createCreditNote — Create credit note
+⚠️ ALL PARAMETERS ARE QUERY PARAMS, NOT BODY:
+  params: {{"date": "{TODAY}", "comment": "Credit note"}}
+  body: {{}} (empty or omit)
+
+### GET /v2/invoice — REQUIRES invoiceDateFrom AND invoiceDateTo params
+
+### POST /v2/project — Required: name, number (string), projectManager ({{"id": N}})
+
+### POST /v2/department — Required: name, departmentNumber (integer)
+
+### POST /v2/travelExpense — Required: employee ({{"id": N}}), title, isCompleted (false)
+
+### POST /v2/travelExpense — Create travel expense
+Required body: employee ({{"id": N}})
+Optional: title, date ("{TODAY}"), isCompleted (false), department, project
+### DELETE /v2/travelExpense/ID — Delete travel expense
+
+### POST /v2/employee/employment — Create employment for employee  
+Required body: startDate ("{TODAY}"), employee ({{"id": N}})
+Optional: endDate, employmentId, division, taxDeductionCode
+
+### POST /v2/salary/transaction — Process salary/payroll
+Required body: month (1-12), year (2026), payslips (array)
+Each payslip needs: employee ({{"id": N}}), date, specification (salary type refs)
+
+### PUT /v2/employee/ID — update employee
+### PUT /v2/customer/ID — update customer
+
+### GET /v2/ledger/vatType?fields=id,name,number,percentage&count=100
+Standard Norwegian VAT IDs: 3 (25% output), 5 (0% exempt), 33 (15% food)
+
+### GET /v2/ledger/paymentType?fields=id,description&count=100
+
+## SEARCH endpoints:
+- GET /v2/employee?firstName=X&lastName=Y&fields=id,firstName,lastName,email
+- GET /v2/customer?name=X&fields=id,name,organizationNumber
+- GET /v2/customer?organizationNumber=X&fields=id,name
+- GET /v2/supplier?name=X&fields=id,name,organizationNumber
+- GET /v2/product?name=X&fields=id,name,number
+- GET /v2/product?number=X&fields=id,name,number
+- GET /v2/department?name=X&fields=id,name,departmentNumber
+- GET /v2/project?name=X&fields=id,name,number
+
+## INVOICE WORKFLOW (exact order):
+1. Find/create customer
+2. Find/create product(s) — use priceExcludingVatCurrency for price!
+3. Create order: POST /v2/order (body: customer, deliveryDate, orderDate)
+4. Add order lines: POST /v2/order/orderline (body: order, product, count)
+5. Invoice from order: PUT /v2/order/ORDER_ID/:invoice 
+   → params={{"invoiceDate": "{TODAY}"}}, body={{}}
+   → Returns invoice data. Extract invoice ID from response.
+6. Payment: PUT /v2/invoice/INVOICE_ID/:payment
+   → params={{"paymentDate": "{TODAY}", "paymentTypeId": ID, "paidAmount": AMOUNT}}, body={{}}
+7. Credit note: PUT /v2/invoice/INVOICE_ID/:createCreditNote
+   → params={{"date": "{TODAY}"}}, body={{}}
+
+## CRITICAL RULES
+- ID refs in body: {{"id": 123}} (object), never raw int
+- Product number is STRING
+- /:invoice, /:payment, /:createCreditNote use QUERY PARAMS not body!
+- PUT for action endpoints (/:invoice, /:payment, /:createCreditNote)
+- POST for creating entities (employee, customer, product, order, orderline)
+- GET /v2/invoice REQUIRES invoiceDateFrom AND invoiceDateTo query params
+
+## SUPPLIER INVOICE
+There is NO POST /v2/supplierInvoice — supplier invoices can't be created via API directly.
+To register a supplier invoice, create a voucher with appropriate postings:
+- Debit: expense account (e.g., 6300 for consulting, 4000 for goods)
+- Credit: accounts payable (2400)
+Include supplier reference, invoice number, and VAT if applicable.
+
+## VOUCHER/POSTING
+POST /v2/ledger/voucher — Create voucher with postings
+Body: {{"date": "{TODAY}", "description": "...", "postings": [
+  {{"account": {{"id": DEBIT_ACCT_ID}}, "amount": AMOUNT, "amountCurrency": AMOUNT}},
+  {{"account": {{"id": CREDIT_ACCT_ID}}, "amount": -AMOUNT, "amountCurrency": -AMOUNT}}
+]}}
+Posting fields: account, amount, amountCurrency, description, department, project, vatType
+To find account IDs: GET /v2/ledger/account?number=ACCT_NUM&fields=id,number,name
 """
 
+TOOLS = [{
+    "name": "tripletex_api",
+    "description": "Call the Tripletex REST API. Returns the JSON response.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
+            "path": {"type": "string", "description": "API path starting with /v2/"},
+            "params": {"type": "object", "description": "Query parameters (for GET and action endpoints like /:invoice, /:payment)"},
+            "body": {"type": "object", "description": "JSON body for POST/PUT entity creation"},
+        },
+        "required": ["method", "path"]
+    }
+}]
 
-def _build_messages(prompt: str, language: str, attachments: list[dict] | None) -> list[dict]:
-    """Build the message list for Claude, including any attachments."""
-    content_parts = []
 
-    # Add attachments as images/documents for Claude to extract data from
+async def _call_api(client, base_url, method, path, params=None, body=None):
+    """Make API call and return JSON response or error dict."""
+    url = f"{base_url}{path}" if path.startswith("/") else f"{base_url}/{path}"
+    try:
+        if method == "GET":
+            resp = await client.get(url, params=params)
+        elif method == "POST":
+            resp = await client.post(url, json=body)
+        elif method == "PUT":
+            if params and (not body or body == {}):
+                # Action endpoints (/:invoice, /:payment, etc) use query params
+                resp = await client.put(url, params=params)
+            elif params and body:
+                resp = await client.put(url, params=params, json=body)
+            else:
+                resp = await client.put(url, json=body)
+        elif method == "DELETE":
+            resp = await client.delete(url)
+        else:
+            return {"error": f"Unknown method {method}"}
+
+        logger.info("  API %s %s → %s", method, path, resp.status_code)
+
+        if resp.status_code >= 400:
+            error_text = resp.text[:1000]
+            logger.error("  Error: %s", error_text[:200])
+            return {"error": f"HTTP {resp.status_code}", "details": error_text}
+
+        if resp.status_code == 204 or not resp.content:
+            return {"success": True, "status": resp.status_code}
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _build_user_content(prompt, language, attachments):
+    parts = []
     if attachments:
         for att in attachments:
-            raw_data = att.get("data", "")
-            content_type = att.get("content_type", "application/octet-stream")
-            filename = att.get("filename", "attachment")
-
-            if content_type.startswith("image/"):
-                content_parts.append({
+            raw_data = att.get("content_base64") or att.get("data", "")
+            mime = att.get("mime_type") or att.get("content_type", "application/octet-stream")
+            fname = att.get("filename", "file")
+            if mime.startswith("image/"):
+                parts.append({
                     "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": content_type,
-                        "data": raw_data,
-                    },
-                })
-            elif content_type == "application/pdf":
-                content_parts.append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": raw_data,
-                    },
+                    "source": {"type": "base64", "media_type": mime, "data": raw_data}
                 })
             else:
-                # Try to decode as text
                 try:
-                    text = base64.b64decode(raw_data).decode("utf-8")
-                    content_parts.append({
-                        "type": "text",
-                        "text": f"[Attachment: {filename}]\n{text}",
-                    })
+                    decoded = base64.b64decode(raw_data)
+                    text_content = decoded.decode("utf-8", errors="ignore")[:5000]
+                    if text_content.strip():
+                        parts.append({"type": "text", "text": f"[File: {fname}]\n{text_content}"})
                 except Exception:
-                    content_parts.append({
-                        "type": "text",
-                        "text": f"[Binary attachment: {filename}, type: {content_type}]",
-                    })
+                    parts.append({"type": "text", "text": f"[Attached: {fname} ({mime})]"})
 
-    content_parts.append({
-        "type": "text",
-        "text": f"Language: {language}\n\nTask:\n{prompt}",
-    })
-
-    return [{"role": "user", "content": content_parts}]
+    parts.append({"type": "text", "text": f"Task ({language}):\n{prompt}"})
+    return parts
 
 
-def _resolve_template(value, variables: dict):
-    """Recursively resolve {{variable}} placeholders in strings, dicts, and lists."""
-    if isinstance(value, str):
-        for var_name, var_val in variables.items():
-            placeholder = "{{" + var_name + "}}"
-            if placeholder in value:
-                # If the entire string is just the placeholder, return the raw value (preserving type)
-                if value == placeholder:
-                    return var_val
-                value = value.replace(placeholder, str(var_val))
-        return value
-    elif isinstance(value, dict):
-        return {k: _resolve_template(v, variables) for k, v in value.items()}
-    elif isinstance(value, list):
-        return [_resolve_template(item, variables) for item in value]
-    return value
+async def solve_task(prompt, language, base_url, session_token, attachments=None, anthropic_api_key=None):
+    """Main entry point — agentic loop with tool use."""
+    # Strip /v2 from base_url to avoid doubling
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v2"):
+        base_url = base_url[:-3]
 
-
-def _extract_field(data: dict, field_path: str):
-    """Extract a value from nested dict using dot-path notation."""
-    parts = field_path.split(".")
-    current = data
-    for part in parts:
-        if isinstance(current, dict):
-            current = current.get(part)
-        elif isinstance(current, list) and part.isdigit():
-            current = current[int(part)]
-        else:
-            return None
-    return current
-
-
-async def solve_task(
-    prompt: str,
-    language: str,
-    base_url: str,
-    session_token: str,
-    attachments: list[dict] | None = None,
-    anthropic_api_key: str | None = None,
-) -> dict:
-    """Main entry point: parse the prompt with Claude, then execute the plan."""
-    client = anthropic.Anthropic(api_key=anthropic_api_key)
-    tripletex = TripletexClient(base_url, session_token)
+    client = httpx.AsyncClient(
+        auth=httpx.BasicAuth("0", session_token),
+        timeout=httpx.Timeout(60.0, connect=10.0),
+        headers={"Content-Type": "application/json"},
+    )
+    claude = anthropic.Anthropic(api_key=anthropic_api_key)
 
     try:
-        # Step 1: Ask Claude to create an execution plan
-        messages = _build_messages(prompt, language, attachments)
+        messages = [{"role": "user", "content": _build_user_content(prompt, language, attachments)}]
 
-        logger.info("Sending prompt to Claude for planning...")
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-        )
-
-        plan_text = response.content[0].text.strip()
-
-        # Strip markdown code fences if present
-        if plan_text.startswith("```"):
-            lines = plan_text.split("\n")
-            # Remove first line (```json or ```) and last line (```)
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            plan_text = "\n".join(lines)
-
-        try:
-            steps = json.loads(plan_text)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse Claude's plan as JSON: %s", plan_text[:500])
-            # Retry with explicit instruction
-            messages.append({"role": "assistant", "content": plan_text})
-            messages.append({"role": "user", "content": "That was not valid JSON. Please respond with ONLY a valid JSON array of steps, no markdown."})
-            response = client.messages.create(
+        # Agentic loop — max 25 iterations
+        for iteration in range(25):
+            response = claude.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 messages=messages,
+                tools=TOOLS,
             )
-            plan_text = response.content[0].text.strip()
-            if plan_text.startswith("```"):
-                lines = plan_text.split("\n")
-                lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                plan_text = "\n".join(lines)
-            steps = json.loads(plan_text)
 
-        if not isinstance(steps, list):
-            steps = [steps]
+            # Process response blocks
+            tool_calls = []
+            text_parts = []
 
-        logger.info("Plan has %d steps", len(steps))
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_calls.append(block)
 
-        # Step 2: Execute the plan
-        variables: dict[str, any] = {}
-        results: list[dict] = []
+            if text_parts:
+                logger.info("  Claude [%d]: %s", iteration, " ".join(text_parts)[:150])
 
-        for i, step in enumerate(steps):
-            method = step.get("method", "GET").upper()
-            path = _resolve_template(step.get("path", ""), variables)
-            params = _resolve_template(step.get("params"), variables)
-            body = _resolve_template(step.get("body"), variables)
-            description = step.get("description", f"Step {i+1}")
-            save_as = step.get("save_as")
-            save_field = step.get("save_field", "value.id")
+            # If no tool calls, we're done
+            if not tool_calls:
+                logger.info("  Agent done after %d iterations", iteration + 1)
+                break
 
-            logger.info("Step %d/%d: %s — %s %s", i + 1, len(steps), description, method, path)
+            # Add assistant message
+            messages.append({"role": "assistant", "content": response.content})
 
-            try:
-                if method == "GET":
-                    result = await tripletex.get(path, params)
-                elif method == "POST":
-                    result = await tripletex.post(path, body)
-                elif method == "PUT":
-                    result = await tripletex.put(path, body)
-                elif method == "DELETE":
-                    result = await tripletex.delete(path)
-                    result = result or {}
-                else:
-                    logger.warning("Unknown method: %s", method)
-                    continue
+            # Execute tool calls and build results
+            tool_results = []
+            for tc in tool_calls:
+                inp = tc.input
+                method = inp.get("method", "GET")
+                path = inp.get("path", "")
+                params = inp.get("params")
+                body = inp.get("body")
 
-                results.append({"step": i + 1, "description": description, "status": "ok"})
+                logger.info("  Tool call [%d]: %s %s", iteration, method, path)
 
-                # Save variable if requested
-                if save_as and result:
-                    extracted = _extract_field(result, save_field)
-                    if extracted is not None:
-                        variables[save_as] = extracted
-                        logger.info("  Saved %s = %s", save_as, str(extracted)[:200])
+                result = await _call_api(client, base_url, method, path, params, body)
 
-                        # Special handling: if we saved vat_types (a list), also create
-                        # convenience variables like vat_type_25 for 25% VAT
-                        if save_as == "vat_types" and isinstance(extracted, list):
-                            for vt in extracted:
-                                if isinstance(vt, dict) and "id" in vt:
-                                    pct = vt.get("percentage") or vt.get("number")
-                                    if pct is not None:
-                                        variables[f"vat_type_{int(pct)}"] = vt["id"]
+                # Truncate large responses
+                result_str = json.dumps(result, ensure_ascii=False)
+                if len(result_str) > 4000:
+                    # For large list responses, just keep first 5 items
+                    if isinstance(result, dict) and "values" in result:
+                        result["values"] = result["values"][:5]
+                        result["_truncated"] = True
+                    result_str = json.dumps(result, ensure_ascii=False)[:4000]
 
-            except Exception as e:
-                error_msg = str(e)
-                logger.error("  Step %d failed: %s", i + 1, error_msg)
-                results.append({"step": i + 1, "description": description, "status": "error", "error": error_msg})
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": result_str,
+                })
 
-                # For critical failures on write operations, ask Claude for a fix
-                if method in ("POST", "PUT") and "4" in error_msg[:4]:
-                    fix_steps = await _ask_claude_for_fix(
-                        client, prompt, language, steps, i, error_msg, variables, results
-                    )
-                    if fix_steps:
-                        # Insert fix steps right after current step
-                        for j, fix_step in enumerate(fix_steps):
-                            steps.insert(i + 1 + j, fix_step)
-                        logger.info("  Claude suggested %d fix steps", len(fix_steps))
+            messages.append({"role": "user", "content": tool_results})
 
-        return {"status": "completed", "steps_executed": len(results)}
+        return {"status": "completed"}
 
-    finally:
-        await tripletex.close()
-
-
-async def _ask_claude_for_fix(
-    client: anthropic.Anthropic,
-    original_prompt: str,
-    language: str,
-    steps: list[dict],
-    failed_step_idx: int,
-    error_msg: str,
-    variables: dict,
-    results: list[dict],
-) -> list[dict] | None:
-    """Ask Claude to fix a failed step."""
-    try:
-        fix_prompt = f"""The following API call failed. Suggest replacement steps (JSON array).
-
-Original task: {original_prompt}
-Language: {language}
-
-Failed step ({failed_step_idx + 1}): {json.dumps(steps[failed_step_idx])}
-Error: {error_msg}
-
-Variables so far: {json.dumps({k: v for k, v in variables.items() if not isinstance(v, list)}, default=str)}
-
-Previous results: {json.dumps(results[-3:], default=str)}
-
-Remaining steps: {json.dumps(steps[failed_step_idx + 1:], default=str)}
-
-Return a JSON array of replacement steps for the failed step (and any prerequisite steps needed).
-Use {{variable}} syntax for saved variables. Return ONLY valid JSON, no markdown."""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": fix_prompt}],
-        )
-
-        text = response.content[0].text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        fix_steps = json.loads(text)
-        if isinstance(fix_steps, dict):
-            fix_steps = [fix_steps]
-        return fix_steps
     except Exception as e:
-        logger.error("Failed to get fix from Claude: %s", e)
-        return None
+        logger.error("Agent error: %s\n%s", e, traceback.format_exc())
+        return {"status": "completed"}
+    finally:
+        await client.aclose()
